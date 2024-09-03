@@ -15,7 +15,7 @@ from trl import SFTTrainer
 print("main.py started")
 
 # Use local paths for model and dataset
-model_name = "/app/model"
+model_name = "/app/nano-mistral"
 dataset_path = "/app/dataset"
 new_model = "llama-2-7b-rick-c-137"
 

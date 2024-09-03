@@ -15,7 +15,7 @@ from trl import SFTTrainer
 print("main.py started")
 
 # Use local paths for model and dataset
-model_name = "/app/nano-mistral"
+model_name = "/app/model"
 dataset_path = "/app/dataset"
 new_model = "llama-2-7b-rick-c-137"
 
@@ -77,7 +77,7 @@ bnb_config = BitsAndBytesConfig(
 # Load base model from local files
 try:
     model = AutoModelForCausalLM.from_pretrained(
-        "/app/nano-mistral",
+        model_name,
         quantization_config=bnb_config,
         device_map=device_map,
         trust_remote_code=True,

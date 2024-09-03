@@ -77,7 +77,7 @@ bnb_config = BitsAndBytesConfig(
 # Load base model from local files
 try:
     model = AutoModelForCausalLM.from_pretrained(
-        model_name,
+        "/app/nano-mistral",
         quantization_config=bnb_config,
         device_map=device_map,
         trust_remote_code=True,

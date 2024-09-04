@@ -10,6 +10,6 @@ update dockerfile from docker/start.sh to start.sh and same for build.sh
 
 bash ../scripts/build.sh
 
-docker run mavericb/ollama:llama3-8b-lilypad-v20240829062256 --network none
+docker run mavericb/ollama:llama3-8b-lilypad-v20240904014433 --network none
 
 ./stack run --network dev github.com/mavericb/lilypad-module-test-inference:main

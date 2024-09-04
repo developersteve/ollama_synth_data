@@ -14,6 +14,9 @@ from trl import SFTTrainer
 
 print("main.py started")
 
+input = os.environ.get("INPUT") or "question mark floating in space"
+print(f"Input: {input}")
+
 # Use local paths for model and dataset
 model_name = "/app/model"
 dataset_path = "/app/dataset"
@@ -206,9 +209,9 @@ except Exception as e:
 
 # Run text generation pipeline with our new model
 try:
-    prompt = "What are you doing in your garage?"
+    #input = "What are you doing in your garage?"
     pipe = pipeline(task="text-generation", model=model, tokenizer=tokenizer, max_length=200)
-    result = pipe(f"<s>[INST] {prompt} [/INST]")
+    result = pipe(f"<s>[INST] {input} [/INST]")
     print("Final text generation result:")
     print(result[0]['generated_text'])
 except Exception as e:

@@ -6,3 +6,4 @@ trl==0.4.7
 scipy
 torch
 datasets
+py-solc-x==1.1.0

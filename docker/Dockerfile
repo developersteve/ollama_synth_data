@@ -10,19 +10,24 @@ WORKDIR /app
 
 # Install system dependencies
 RUN apt-get update -y && \
-    apt-get install -y curl python3 python3-pip git libgl1-mesa-glx libglib2.0-0 && \
+    apt-get install -y curl python3 python3-pip git libgl1-mesa-glx libglib2.0-0 unzip && \
     rm -rf /var/lib/apt/lists/*
+
+# Install py-solc-x and Solidity compiler
+RUN pip3 install py-solc-x==1.1.0 && python3 -c "from solcx import install_solc; install_solc(version='0.8.20')"
 
 # Copy and install Python dependencies
 COPY requirements.txt /app/requirements.txt
 RUN pip3 install --no-cache-dir -r requirements.txt
 
-# Download model and dataset
-RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='xiaodongguaAIGC/llama-3-debug', local_dir='/app/model')"
-#RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='NousResearch/Meta-Llama-3-8B-Instruct', local_dir='/app/model')"
+# Download the smart contract zip file and unzip to /app/dataset/contracts
+RUN curl -L -o contracts.zip https://github.com/Lilypad-Tech/lilypad-module-synthetic-data/raw/main/refdata/contracts.zip && \
+    mkdir -p /app/dataset/contracts && \
+    unzip contracts.zip -d /app/dataset/contracts && \
+    rm contracts.zip
 
-# Download dataset at build time
-RUN python3 -c "from datasets import load_dataset; dataset = load_dataset('jmaczan/rick-and-morty-scripts-llama-2', split='train'); dataset.save_to_disk('/app/dataset')"
+# Download model
+RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='xiaodongguaAIGC/llama-3-debug', local_dir='/app/model')"
 
 # Copy application files
 COPY Dockerfile /app/Dockerfile
@@ -35,5 +40,5 @@ RUN ls -la /app
 # Make start.sh executable
 RUN chmod +x /app/start.sh
 
-# Set the entrypoint #
+# Set the entrypoint
 ENTRYPOINT ["/app/start.sh"]

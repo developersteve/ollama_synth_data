@@ -1,98 +1,80 @@
 import os
 import random
+import logging
+import re
+from typing import List, Tuple
+
 import torch
 from torch.utils.data import Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, Trainer, TrainingArguments
-from solcx import compile_source, install_solc, set_solc_version
-import re
-
-# Install Solidity compiler
-print("Installing Solidity compiler...")
-install_solc(version="0.8.20")
-
-# Seed, number of contracts, and token standard as environment inputs
-seed = int(os.environ.get("SEED", 42))  # Default to 42 if SEED is not provided
-num_contracts = int(os.environ.get("NUM_CONTRACTS", 1))  # Default to 1 contract if NUM_CONTRACTS is not provided
-token_standard = os.environ.get("TOKEN_STANDARD", "ERC-20")  # Default to ERC-20 if TOKEN_STANDARD is not provided
-
-print(f"Environment Variables - SEED: {seed}, NUM_CONTRACTS: {num_contracts}, TOKEN_STANDARD: {token_standard}")
-
-# Set random seed
-random.seed(seed)
-torch.manual_seed(seed)
-
-# Use local paths for model and dataset
-model_name = "/app/model"
-contracts_path = "/app/dataset/contracts"  # Directory where ERC-20 contracts are stored
-
-print(f"Using model path: {model_name}")
-print(f"Using contract path: {contracts_path}")
-
-# bitsandbytes parameters
-use_4bit = True
-bnb_4bit_compute_dtype = "float16"
-bnb_4bit_quant_type = "nf4"
-use_nested_quant = False
-
-# Load model and tokenizer
-print("Loading model and tokenizer...")
-compute_dtype = getattr(torch, bnb_4bit_compute_dtype)
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=use_4bit,
-    bnb_4bit_quant_type=bnb_4bit_quant_type,
-    bnb_4bit_compute_dtype=compute_dtype,
-    bnb_4bit_use_double_quant=use_nested_quant,
+from transformers import (
+    AutoModelForSeq2SeqLM,
+    AutoTokenizer,
+    TrainingArguments,
 )
+from solcx import compile_source, set_solc_version
+from peft import LoraConfig
+from trl import SFTTrainer
 
-model = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    quantization_config=bnb_config,
-    device_map={"": 0},
-    trust_remote_code=True,
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
-model.config.use_cache = False
+logger = logging.getLogger(__name__)
 
-tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-tokenizer.add_special_tokens({'pad_token': '[PAD]'})
-tokenizer.pad_token = tokenizer.eos_token
-tokenizer.padding_side = "right"
-
-print("Model and tokenizer loaded successfully.")
-
-# Function to load Solidity contracts from the directory
-def load_contract_examples(path_to_contracts: str):
-    print("Loading contract examples from:", path_to_contracts)
+def load_contract_examples(path_to_contracts: str) -> List[str]:
+    """Load Solidity contract examples from a directory."""
+    logger.info(f"Loading contract examples from: {path_to_contracts}")
     contract_texts = []
     for filename in os.listdir(path_to_contracts):
-        if filename.endswith(".sol"):  # Only load Solidity files
-            with open(os.path.join(path_to_contracts, filename), 'r') as file:
-                contract_text = file.read()
-                contract_texts.append(contract_text)
-    print(f"Loaded {len(contract_texts)} contracts from {path_to_contracts}")
+        if filename.endswith(".sol"):
+            with open(os.path.join(path_to_contracts, filename), "r") as file:
+                contract_texts.append(file.read())
+    logger.info(f"Loaded {len(contract_texts)} contracts from {path_to_contracts}")
     return contract_texts
 
-# Function to clean and add necessary pragma and imports
-def add_pragma_and_imports(synthetic_contract):
-    pragma_statement = "// SPDX-License-Identifier: MIT\npragma solidity ^0.8.20;\n\n"
-    if not synthetic_contract.startswith("pragma solidity"):
-        synthetic_contract = pragma_statement + synthetic_contract
+def add_pragma_and_imports(synthetic_contract: str) -> str:
+    """Ensure correct pragma version, clean up imports, and ensure necessary elements are present."""
+    
+    correct_pragma = "pragma solidity ^0.8.20;"
+    spdx_license = "// SPDX-License-Identifier: UNLICENSED"
+    
+    openzeppelin_path = 'import "../openzeppelin-contracts/openzeppelin-contracts-4.8.0/contracts/'
+    
+    synthetic_contract = re.sub(r"pragma solidity\s+[^\;]+;", "", synthetic_contract)
+    
+    if correct_pragma not in synthetic_contract:
+        synthetic_contract = correct_pragma + "\n" + synthetic_contract
+    
+    if spdx_license not in synthetic_contract:
+        synthetic_contract = spdx_license + "\n" + synthetic_contract
+    
+    synthetic_contract = re.sub(r"/\*.*?\*/", "", synthetic_contract, flags=re.DOTALL)
+    
+    synthetic_contract = re.sub(r'import\s+"@openzeppelin/contracts/', openzeppelin_path, synthetic_contract)
+    
+    required_imports = [
+        f'{openzeppelin_path}token/ERC20/ERC20.sol";',
+        f'{openzeppelin_path}access/Ownable.sol";'
+    ]
+    
+    for imp in required_imports:
+        if imp not in synthetic_contract:
+            synthetic_contract = imp + "\n" + synthetic_contract
 
-    # Clean up unnecessary or incomplete comment blocks (e.g., /** ... */)
-    synthetic_contract = re.sub(r'/\*\*.*?\*/', '', synthetic_contract, flags=re.DOTALL)
+    return synthetic_contract.strip()
 
-    return synthetic_contract
-
-# Create a custom dataset for fine-tuning
 class SolidityDataset(Dataset):
-    def __init__(self, contracts, tokenizer, max_length=512):
+    """Dataset for Solidity contracts."""
+
+    def __init__(self, contracts: List[str], tokenizer, max_length: int = 512):
         self.contracts = contracts
         self.tokenizer = tokenizer
         self.max_length = max_length
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.contracts)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx: int) -> dict:
         contract = self.contracts[idx]
         tokenized = self.tokenizer(
             contract,
@@ -101,122 +83,162 @@ class SolidityDataset(Dataset):
             max_length=self.max_length,
             return_tensors="pt"
         )
-        # Set the labels equal to the input_ids for causal language modeling
         tokenized["labels"] = tokenized["input_ids"].clone()
-        return {
-            "input_ids": tokenized["input_ids"].squeeze(),
-            "attention_mask": tokenized["attention_mask"].squeeze(),
-            "labels": tokenized["labels"].squeeze()  # Labels for loss computation
-        }
+        return tokenized
 
-# Fine-tune the model using the loaded contracts
-def finetune_model(model, tokenizer, contract_examples):
-    print("Preparing the dataset for fine-tuning...")
-    dataset = SolidityDataset(contract_examples, tokenizer)
+def generate_synthetic_contract(
+    model, tokenizer, prompt: str, max_length: int = 512
+) -> str:
+    """Generate a synthetic contract using the given model and tokenizer."""
+    logger.info("Generating synthetic contract...")
+    device = next(model.parameters()).device
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
-    print("Starting the fine-tuning process...")
-    training_args = TrainingArguments(
-        output_dir="/app/results",
-        num_train_epochs=1,
-        per_device_train_batch_size=1,  # Keep batch size low for memory efficiency
-        gradient_accumulation_steps=4,  # Adjust this to maintain effective batch size
-        save_strategy="no",  # Disable saving during training
-        logging_dir="/app/logs",
-        logging_steps=10,
-        optim="adamw_torch",
-    )
+    with torch.no_grad():
+        outputs = model.generate(**inputs, max_length=max_length, num_return_sequences=1)
 
-    trainer = Trainer(
-        model=model,
-        args=training_args,
-        train_dataset=dataset,
-        tokenizer=tokenizer,
-    )
-
-    trainer.train()
-    print("Fine-tuning completed.")
-    return model
-
-# Function to generate synthetic smart contract
-def generate_synthetic_contract(model, tokenizer, prompt, max_length=512):
-    print("Generating synthetic contract...")
-    device = model.device  # Get the device the model is using (GPU or CPU)
-    inputs = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
-    outputs = model.generate(inputs, max_length=max_length, num_return_sequences=1)
     synthetic_contract = tokenizer.decode(outputs[0], skip_special_tokens=True)
     return add_pragma_and_imports(synthetic_contract)
 
-# Function to validate smart contract using py-solc-x
-def validate_contract(contract_code: str):
-    print("Validating contract...")
+def validate_contract(contract_code: str) -> Tuple[bool, str]:
+    """Validate a Solidity contract."""
+    logger.info("Validating contract...")
     try:
-        set_solc_version('0.8.20')
-        compiled_sol = compile_source(contract_code, output_values=["abi", "bin"])
-        print("Contract validation successful.")
+        set_solc_version("0.8.20")
+        compile_source(contract_code, output_values=["abi", "bin"])
+        logger.info("Contract validation successful.")
         return True, None
     except Exception as e:
-        print(f"Contract validation failed: {e}")
+        logger.error(f"Contract validation failed: {e}")
         return False, str(e)
 
-# Function to categorize errors for targeted fine-tuning
-def categorize_error(error_message):
-    if "pragma" in error_message or "import" in error_message:
-        return "pragma_or_import_issue"
-    elif "primary expression" in error_message or re.search(r'!+', error_message):
-        return "syntax_noise"  # Handling invalid characters like '!'
-    return "general_error"
+def setup_model_and_tokenizer(model_name: str):
+    """Set up the model and tokenizer."""
+    logger.info("Loading model and tokenizer...")
+    
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        model_name,
+        device_map={"": 0},
+        trust_remote_code=True,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+    tokenizer.pad_token = tokenizer.eos_token
+    tokenizer.padding_side = "right"
 
-# Function to perform basic syntactical cleaning
-def basic_syntax_check(contract_code):
-    # Allow more flexibility: only reject contracts with extreme issues like excessive repeated characters
-    if re.search(r'!{5,}', contract_code):  # Check if there are more than 5 consecutive '!'
-        return False
-    # Ensure there is no hanging multi-line comment
-    if re.search(r'/\*\*[^*]*$', contract_code):  # Incomplete comment block
-        return False
-    return True
+    return model, tokenizer
 
-# Load the ERC-20 contract examples from the specified directory
-contract_examples = load_contract_examples(contracts_path)
+def setup_training_config(output_dir: str):
+    """Set up the training configuration."""
+    peft_config = LoraConfig(
+        lora_alpha=16,
+        lora_dropout=0.1,
+        r=64,
+        bias="none",
+        task_type="SEQ2SEQ_LM",
+    )
 
-# Fine-tune the model using the contract examples
-model = finetune_model(model, tokenizer, contract_examples)
+    training_arguments = TrainingArguments(
+        output_dir=output_dir,
+        num_train_epochs=1,
+        per_device_train_batch_size=4,
+        gradient_accumulation_steps=1,
+        optim="paged_adamw_32bit",
+        save_steps=25,
+        logging_steps=25,
+        learning_rate=2e-4,
+        weight_decay=0.001,
+        fp16=False,
+        bf16=False,
+        max_grad_norm=0.3,
+        max_steps=-1,
+        warmup_ratio=0.03,
+        group_by_length=True,
+        lr_scheduler_type="constant",
+    )
 
-# Generate the required number of valid contracts
-valid_contracts = []
-generated_count = 0
-error_feedback = []
+    return peft_config, training_arguments
 
-while len(valid_contracts) < num_contracts:
-    print(f"Generating contract {generated_count + 1}/{num_contracts}...")
-    prompt = random.choice(contract_examples)[:512]
-    synthetic_contract = generate_synthetic_contract(model, tokenizer, prompt)
+def finetune_model(model, dataset, peft_config, training_arguments, tokenizer):
+    """Fine-tune the model."""
+    logger.info("Starting the fine-tuning process...")
+    try:
+        trainer = SFTTrainer(
+            model=model,
+            train_dataset=dataset,
+            peft_config=peft_config,
+            tokenizer=tokenizer,
+            args=training_arguments,
+            dataset_text_field="input_ids"  # Ensure dataset uses correct text field for training
+        )
+        trainer.train()
+        logger.info("Fine-tuning completed successfully")
+        return trainer.model
+    except Exception as e:
+        logger.error(f"Error during fine-tuning: {e}")
+        raise
 
-    # Perform basic syntax validation before compiling
-    if not basic_syntax_check(synthetic_contract):
-        print("Contract skipped due to obvious syntax issues.")
-        continue
+def generate_contracts(model, tokenizer, contract_examples, num_contracts):
+    """Generate valid contracts."""
+    valid_contracts = []
 
-    # Validate the synthetic contract
-    is_valid, error_message = validate_contract(synthetic_contract)
+    while len(valid_contracts) < num_contracts:
+        logger.info(f"Generating contract {len(valid_contracts) + 1}/{num_contracts}...")
+        prompt = random.choice(contract_examples)[:512]
+        synthetic_contract = generate_synthetic_contract(model, tokenizer, prompt)
 
-    if is_valid:
-        valid_contracts.append(synthetic_contract)
-        generated_count += 1
-        print(f"Contract {generated_count} is valid.")
-    else:
-        error_type = categorize_error(error_message)
-        error_feedback.append((error_type, synthetic_contract))
-        print(f"Contract {generated_count + 1} is invalid. Error: {error_message}")
+        logger.info("Generated Contract:")
+        logger.info(synthetic_contract)
+        logger.info("-" * 50)
 
-        # Skip fine-tuning if the error is due to syntax noise like repeated '!'
-        if error_type == "syntax_noise":
-            print("Skipping fine-tuning due to noise (syntax).")
-            continue
+        is_valid, error_message = validate_contract(synthetic_contract)
 
-        # Fine-tune the model based on error feedback
-        if len(error_feedback) > 0:
-            feedback_contracts = [entry[1] for entry in error_feedback if entry[0] == error_type]
-            model = finetune_model(model, tokenizer, feedback_contracts)
+        if is_valid:
+            valid_contracts.append(synthetic_contract)
+            logger.info(f"Contract {len(valid_contracts)} is valid.")
+        else:
+            logger.info(f"Contract is invalid. Error: {error_message}")
 
-print(f"Generated {len(valid_contracts)} valid contracts.")
+    return valid_contracts
+
+def main():
+    """Main function to run the Smart Contract Generator."""
+    logger.info("Smart Contract Generator started")
+
+    seed = int(os.environ.get("SEED", 42))
+    num_contracts = int(os.environ.get("NUM_CONTRACTS", 1))
+    token_standard = os.environ.get("TOKEN_STANDARD", "ERC-20")
+
+    logger.info(
+        f"Environment Variables - SEED: {seed}, "
+        f"NUM_CONTRACTS: {num_contracts}, TOKEN_STANDARD: {token_standard}"
+    )
+
+    random.seed(seed)
+    torch.manual_seed(seed)
+
+    model_name = "/app/model"
+    contracts_path = "/app/dataset/contracts"
+    output_dir = "/app/results"
+
+    model, tokenizer = setup_model_and_tokenizer(model_name)
+    peft_config, training_arguments = setup_training_config(output_dir)
+
+    contract_examples = load_contract_examples(contracts_path)
+    dataset = SolidityDataset(contract_examples, tokenizer)
+
+    finetuned_model = finetune_model(
+        model, dataset, peft_config, training_arguments, tokenizer
+    )
+
+    valid_contracts = generate_contracts(
+        finetuned_model, tokenizer, contract_examples, num_contracts
+    )
+
+    logger.info(f"Generated {len(valid_contracts)} valid contracts.")
+
+    finetuned_model.save_pretrained(os.path.join(output_dir, "finetuned_model"))
+    tokenizer.save_pretrained(os.path.join(output_dir, "finetuned_model"))
+
+if __name__ == "__main__":
+    main()

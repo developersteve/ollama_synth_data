@@ -26,8 +26,15 @@ RUN curl -L -o contracts.zip https://github.com/Lilypad-Tech/lilypad-module-synt
     unzip contracts.zip -d /app/dataset/contracts && \
     rm contracts.zip
 
+# Add this to your Dockerfile
+RUN mkdir -p /app/openzeppelin-contracts && \
+    curl -L -o openzeppelin-contracts.zip https://github.com/OpenZeppelin/openzeppelin-contracts/archive/refs/tags/v4.8.0.zip && \
+    unzip openzeppelin-contracts.zip -d /app/openzeppelin-contracts && \
+    rm openzeppelin-contracts.zip
+
 # Download model
-RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='xiaodongguaAIGC/llama-3-debug', local_dir='/app/model')"
+#RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='xiaodongguaAIGC/llama-3-debug', local_dir='/app/model')" #debug model
+RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download(repo_id='google/flan-t5-large', local_dir='/app/model')"
 
 # Copy application files
 COPY Dockerfile /app/Dockerfile

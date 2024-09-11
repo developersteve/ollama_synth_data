@@ -1,90 +1,95 @@
 import os
+import torch
 import random
 import logging
 import re
 from typing import List, Tuple
 
-import torch
-from torch.utils.data import Dataset
 from transformers import (
     AutoModelForSeq2SeqLM,
     AutoTokenizer,
-    TrainingArguments,
 )
-from solcx import compile_source, set_solc_version
+from datasets import Dataset
 from peft import LoraConfig
 from trl import SFTTrainer
+from transformers import TrainingArguments
+
+from solcx import compile_source, install_solc
+from solcx.exceptions import SolcError
 
 # Set up logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
-)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def load_contract_examples(path_to_contracts: str) -> List[str]:
-    """Load Solidity contract examples from a directory."""
-    logger.info(f"Loading contract examples from: {path_to_contracts}")
-    contract_texts = []
-    for filename in os.listdir(path_to_contracts):
+
+def load_contract_examples(contracts_path: str) -> List[str]:
+    """Load contract examples from a directory."""
+    logger.info(f"Loading contract examples from: {contracts_path}")
+    contract_examples = []
+
+    for filename in os.listdir(contracts_path):
         if filename.endswith(".sol"):
-            with open(os.path.join(path_to_contracts, filename), "r") as file:
-                contract_texts.append(file.read())
-    logger.info(f"Loaded {len(contract_texts)} contracts from {path_to_contracts}")
-    return contract_texts
+            with open(os.path.join(contracts_path, filename), "r") as f:
+                contract_examples.append(f.read())
+
+    logger.info(f"Loaded {len(contract_examples)} contracts from {contracts_path}")
+    return contract_examples
+
 
 def add_pragma_and_imports(synthetic_contract: str) -> str:
     """Ensure correct pragma version, clean up imports, and ensure necessary elements are present."""
     
+    # Define the correct pragma and import statements
     correct_pragma = "pragma solidity ^0.8.20;"
     spdx_license = "// SPDX-License-Identifier: UNLICENSED"
     
-    openzeppelin_path = 'import "../openzeppelin-contracts/openzeppelin-contracts-4.8.0/contracts/'
+    # Path to where OpenZeppelin contracts are located in the container
+    openzeppelin_path = "import \"../openzeppelin-contracts/openzeppelin-contracts-4.8.0/contracts/"
     
+    # Remove incorrect pragma versions (e.g., `0.8.0` or any other)
     synthetic_contract = re.sub(r"pragma solidity\s+[^\;]+;", "", synthetic_contract)
     
+    # Add the correct pragma at the top if it's not already there
     if correct_pragma not in synthetic_contract:
         synthetic_contract = correct_pragma + "\n" + synthetic_contract
     
+    # Add the SPDX-License-Identifier at the top if it's not already there
     if spdx_license not in synthetic_contract:
         synthetic_contract = spdx_license + "\n" + synthetic_contract
     
+    # Remove unnecessary multi-line comments (e.g., block comments) that appear at the start
     synthetic_contract = re.sub(r"/\*.*?\*/", "", synthetic_contract, flags=re.DOTALL)
     
+    # Replace OpenZeppelin imports with the correct path
     synthetic_contract = re.sub(r'import\s+"@openzeppelin/contracts/', openzeppelin_path, synthetic_contract)
     
+    # Ensure there are no duplicated imports (e.g., OpenZeppelin libraries)
+    # List any required imports that should always be present
     required_imports = [
         f'{openzeppelin_path}token/ERC20/ERC20.sol";',
         f'{openzeppelin_path}access/Ownable.sol";'
     ]
     
+    # Add each required import if it's not already in the contract
     for imp in required_imports:
         if imp not in synthetic_contract:
             synthetic_contract = imp + "\n" + synthetic_contract
 
+    # Return the cleaned-up contract
     return synthetic_contract.strip()
 
-class SolidityDataset(Dataset):
-    """Dataset for Solidity contracts."""
 
-    def __init__(self, contracts: List[str], tokenizer, max_length: int = 512):
-        self.contracts = contracts
-        self.tokenizer = tokenizer
-        self.max_length = max_length
+def validate_contract(contract_code: str) -> Tuple[bool, str]:
+    """Validate the Solidity contract code."""
+    logger.info("Validating the contract...")
+    try:
+        compile_source(contract_code, output_values=["abi", "bin"])
+        logger.info("Contract is valid.")
+        return True, ""
+    except SolcError as e:
+        logger.error(f"Contract validation failed: {e}")
+        return False, str(e)
 
-    def __len__(self) -> int:
-        return len(self.contracts)
-
-    def __getitem__(self, idx: int) -> dict:
-        contract = self.contracts[idx]
-        tokenized = self.tokenizer(
-            contract,
-            truncation=True,
-            padding="max_length",
-            max_length=self.max_length,
-            return_tensors="pt"
-        )
-        tokenized["labels"] = tokenized["input_ids"].clone()
-        return tokenized
 
 def generate_synthetic_contract(
     model, tokenizer, prompt: str, max_length: int = 512
@@ -98,35 +103,45 @@ def generate_synthetic_contract(
         outputs = model.generate(**inputs, max_length=max_length, num_return_sequences=1)
 
     synthetic_contract = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    # Ensure basic Solidity elements are present
+    if "contract" not in synthetic_contract and "function" not in synthetic_contract:
+        synthetic_contract += "\n\ncontract GeneratedContract {\n    function example() public {}\n}"
+
     return add_pragma_and_imports(synthetic_contract)
 
-def validate_contract(contract_code: str) -> Tuple[bool, str]:
-    """Validate a Solidity contract."""
-    logger.info("Validating contract...")
-    try:
-        set_solc_version("0.8.20")
-        compile_source(contract_code, output_values=["abi", "bin"])
-        logger.info("Contract validation successful.")
-        return True, None
-    except Exception as e:
-        logger.error(f"Contract validation failed: {e}")
-        return False, str(e)
+def prepare_dataset(contracts: List[str], tokenizer) -> Dataset:
+    """Prepare dataset using the Hugging Face datasets library."""
+    logger.info("Preparing the dataset...")
+    
+    # Define a preprocessing function
+    def preprocess_function(examples):
+        return tokenizer(
+            examples["text"], padding="max_length", truncation=True, max_length=512
+        )
+
+    # Create a dataset from a list of dictionaries
+    raw_dataset = Dataset.from_dict({"text": contracts})
+    
+    # Tokenize the dataset
+    tokenized_dataset = raw_dataset.map(preprocess_function, batched=True)
+    return tokenized_dataset
+
 
 def setup_model_and_tokenizer(model_name: str):
     """Set up the model and tokenizer."""
     logger.info("Loading model and tokenizer...")
-    
+
     model = AutoModelForSeq2SeqLM.from_pretrained(
         model_name,
-        device_map={"": 0},
-        trust_remote_code=True,
+        device_map="auto",  # Automatically map model to devices
     )
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    tokenizer.add_special_tokens({"pad_token": "[PAD]"})
-    tokenizer.pad_token = tokenizer.eos_token
+
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     tokenizer.padding_side = "right"
 
     return model, tokenizer
+
 
 def setup_training_config(output_dir: str):
     """Set up the training configuration."""
@@ -135,7 +150,7 @@ def setup_training_config(output_dir: str):
         lora_dropout=0.1,
         r=64,
         bias="none",
-        task_type="SEQ2SEQ_LM",
+        task_type="SEQ_2_SEQ_LM",
     )
 
     training_arguments = TrainingArguments(
@@ -143,7 +158,7 @@ def setup_training_config(output_dir: str):
         num_train_epochs=1,
         per_device_train_batch_size=4,
         gradient_accumulation_steps=1,
-        optim="paged_adamw_32bit",
+        optim="adamw_torch",
         save_steps=25,
         logging_steps=25,
         learning_rate=2e-4,
@@ -159,6 +174,7 @@ def setup_training_config(output_dir: str):
 
     return peft_config, training_arguments
 
+
 def finetune_model(model, dataset, peft_config, training_arguments, tokenizer):
     """Fine-tune the model."""
     logger.info("Starting the fine-tuning process...")
@@ -167,9 +183,11 @@ def finetune_model(model, dataset, peft_config, training_arguments, tokenizer):
             model=model,
             train_dataset=dataset,
             peft_config=peft_config,
+            dataset_text_field="text",
+            max_seq_length=512,  # Adjusted for Flan-T5
             tokenizer=tokenizer,
             args=training_arguments,
-            dataset_text_field="input_ids"  # Ensure dataset uses correct text field for training
+            packing=False,
         )
         trainer.train()
         logger.info("Fine-tuning completed successfully")
@@ -178,12 +196,15 @@ def finetune_model(model, dataset, peft_config, training_arguments, tokenizer):
         logger.error(f"Error during fine-tuning: {e}")
         raise
 
+
 def generate_contracts(model, tokenizer, contract_examples, num_contracts):
     """Generate valid contracts."""
     valid_contracts = []
 
     while len(valid_contracts) < num_contracts:
-        logger.info(f"Generating contract {len(valid_contracts) + 1}/{num_contracts}...")
+        logger.info(
+            f"Generating contract {len(valid_contracts) + 1}/{num_contracts}..."
+        )
         prompt = random.choice(contract_examples)[:512]
         synthetic_contract = generate_synthetic_contract(model, tokenizer, prompt)
 
@@ -201,13 +222,16 @@ def generate_contracts(model, tokenizer, contract_examples, num_contracts):
 
     return valid_contracts
 
+
 def main():
     """Main function to run the Smart Contract Generator."""
     logger.info("Smart Contract Generator started")
 
+    # Environment setup
+    install_solc(version="0.8.20")
     seed = int(os.environ.get("SEED", 42))
     num_contracts = int(os.environ.get("NUM_CONTRACTS", 1))
-    token_standard = os.environ.get("TOKEN_STANDARD", "ERC-20")
+    token_standard = os.environ.get("TOKEN_STANDARD", "ERC20")
 
     logger.info(
         f"Environment Variables - SEED: {seed}, "
@@ -217,28 +241,37 @@ def main():
     random.seed(seed)
     torch.manual_seed(seed)
 
+    # Paths and configurations
     model_name = "/app/model"
     contracts_path = "/app/dataset/contracts"
     output_dir = "/app/results"
 
+    # Setup model, tokenizer, and configurations
     model, tokenizer = setup_model_and_tokenizer(model_name)
     peft_config, training_arguments = setup_training_config(output_dir)
 
+    # Load dataset
     contract_examples = load_contract_examples(contracts_path)
-    dataset = SolidityDataset(contract_examples, tokenizer)
 
+    # Prepare dataset using Hugging Face dataset format
+    dataset = prepare_dataset(contract_examples, tokenizer)
+
+    # Fine-tune the model
     finetuned_model = finetune_model(
         model, dataset, peft_config, training_arguments, tokenizer
     )
 
+    # Generate contracts using the fine-tuned model
     valid_contracts = generate_contracts(
         finetuned_model, tokenizer, contract_examples, num_contracts
     )
 
     logger.info(f"Generated {len(valid_contracts)} valid contracts.")
 
+    # Optional: Save the fine-tuned model
     finetuned_model.save_pretrained(os.path.join(output_dir, "finetuned_model"))
     tokenizer.save_pretrained(os.path.join(output_dir, "finetuned_model"))
+
 
 if __name__ == "__main__":
     main()

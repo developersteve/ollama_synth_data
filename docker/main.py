@@ -44,7 +44,7 @@ def add_pragma_and_imports(synthetic_contract: str) -> str:
     spdx_license = "// SPDX-License-Identifier: UNLICENSED"
     
     # Path to where OpenZeppelin contracts are located in the container
-    openzeppelin_path = "import \"../openzeppelin-contracts/openzeppelin-contracts-4.8.0/contracts/"
+    openzeppelin_path = 'import "../openzeppelin-contracts/openzeppelin-contracts-4.8.0/contracts/'
     
     # Remove incorrect pragma versions (e.g., `0.8.0` or any other)
     synthetic_contract = re.sub(r"pragma solidity\s+[^\;]+;", "", synthetic_contract)
@@ -91,16 +91,28 @@ def validate_contract(contract_code: str) -> Tuple[bool, str]:
         return False, str(e)
 
 
-def generate_synthetic_contract(
-    model, tokenizer, prompt: str, max_length: int = 512
-) -> str:
+def generate_synthetic_contract(model, tokenizer, prompt: str, max_length: int = 512) -> str:
     """Generate a synthetic contract using the given model and tokenizer."""
     logger.info("Generating synthetic contract...")
     device = next(model.parameters()).device
+
+    # Providing a better prompt structure
+    prompt = (
+        "Generate an ERC20 token contract that includes the following functionality:\n"
+        "- Basic token properties like name, symbol, and supply\n"
+        "- Minting and burning functionality\n"
+        "- Ownership and access control\n"
+        "Here is the contract:\n"
+        + prompt
+    )
+
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
     with torch.no_grad():
         outputs = model.generate(**inputs, max_length=max_length, num_return_sequences=1)
+    
+    # Log the generated output
+    logger.info(f"Raw model output: {outputs}")
 
     synthetic_contract = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
@@ -109,6 +121,7 @@ def generate_synthetic_contract(
         synthetic_contract += "\n\ncontract GeneratedContract {\n    function example() public {}\n}"
 
     return add_pragma_and_imports(synthetic_contract)
+
 
 def prepare_dataset(contracts: List[str], tokenizer) -> Dataset:
     """Prepare dataset using the Hugging Face datasets library."""
@@ -155,7 +168,7 @@ def setup_training_config(output_dir: str):
 
     training_arguments = TrainingArguments(
         output_dir=output_dir,
-        num_train_epochs=1,
+        num_train_epochs=3,  # Increased epochs to allow more fine-tuning
         per_device_train_batch_size=4,
         gradient_accumulation_steps=1,
         optim="adamw_torch",
@@ -184,7 +197,7 @@ def finetune_model(model, dataset, peft_config, training_arguments, tokenizer):
             train_dataset=dataset,
             peft_config=peft_config,
             dataset_text_field="text",
-            max_seq_length=512,  # Adjusted for Flan-T5
+            max_seq_length=512,
             tokenizer=tokenizer,
             args=training_arguments,
             packing=False,
@@ -202,9 +215,7 @@ def generate_contracts(model, tokenizer, contract_examples, num_contracts):
     valid_contracts = []
 
     while len(valid_contracts) < num_contracts:
-        logger.info(
-            f"Generating contract {len(valid_contracts) + 1}/{num_contracts}..."
-        )
+        logger.info(f"Generating contract {len(valid_contracts) + 1}/{num_contracts}...")
         prompt = random.choice(contract_examples)[:512]
         synthetic_contract = generate_synthetic_contract(model, tokenizer, prompt)
 
